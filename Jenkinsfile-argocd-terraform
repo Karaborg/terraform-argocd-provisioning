@@ -1,0 +1,148 @@
+import groovy.json.JsonOutput
+
+pipeline {
+    agent any
+
+    options { disableConcurrentBuilds() }
+
+    parameters {
+        choice(name: 'ACTION', choices: ['PLAN', 'APPLY', 'DESTROY'], description: 'Terraform action')
+        choice(name: 'ARGOCD_ENVIRONMENT', choices: ['development', 'staging', 'production'], description: 'Target ArgoCD environment')
+        booleanParam(name: 'CONFIRM_DESTROY', defaultValue: false, description: 'Required only when ACTION is DESTROY')
+
+        string(name: 'PROJECT', defaultValue: 'platform-development', description: 'ArgoCD project and Terraform state key')
+        string(name: 'NAMESPACE', defaultValue: 'example-service', description: 'Kubernetes destination namespace')
+        string(name: 'DESTINATION_SERVER', defaultValue: 'https://kubernetes.default.svc', description: 'Kubernetes API server registered in ArgoCD')
+        string(name: 'REPO_URL', defaultValue: 'https://github.com/example-org/example-app-config.git', description: 'Git repository containing Helm charts')
+        string(name: 'TARGET_REVISION', defaultValue: 'main', description: 'Git branch or target revision')
+        string(name: 'APPLICATION_SUFFIX', defaultValue: '', description: 'Optional suffix for ArgoCD Application names, for example -blue')
+        string(name: 'PATH_PREFIX', defaultValue: '', description: 'Optional Helm path prefix, for example charts')
+        string(name: 'VALUES_FILE', defaultValue: 'values.yaml', description: 'Values file used by all selected applications')
+        string(name: 'STATE_BASE_DIR', defaultValue: '/var/lib/jenkins/terraform-state/argocd', description: 'Persistent state directory outside the Jenkins workspace')
+
+        booleanParam(name: 'SERVICE_API', defaultValue: true, description: 'Provision the example-api application')
+        booleanParam(name: 'SERVICE_WORKER', defaultValue: true, description: 'Provision the example-worker application')
+        booleanParam(name: 'SERVICE_WEB', defaultValue: true, description: 'Provision the example-web application')
+        booleanParam(name: 'SUPPORTING_REDIS', defaultValue: false, description: 'Provision the example Redis application')
+    }
+
+    stages {
+        stage('Check Parameters') {
+            steps {
+                script {
+                    ['PROJECT', 'NAMESPACE', 'DESTINATION_SERVER', 'REPO_URL', 'TARGET_REVISION', 'VALUES_FILE', 'STATE_BASE_DIR'].each { parameterName ->
+                        if (!params[parameterName]?.trim()) { error "${parameterName} cannot be empty." }
+                    }
+                    if (params.ACTION == 'DESTROY' && !params.CONFIRM_DESTROY) {
+                        error 'DESTROY requires CONFIRM_DESTROY to be selected.'
+                    }
+                }
+            }
+        }
+
+        stage('Resolve ArgoCD Environment') {
+            steps {
+                script {
+                    def config = readYaml(file: 'argocd-environments.yml')
+                    if (!config?.credentials) { error 'credentials section not found in argocd-environments.yml' }
+                    def selectedEnvironment = config.credentials[params.ARGOCD_ENVIRONMENT]
+                    if (!selectedEnvironment?.server || !selectedEnvironment?.credentialId) {
+                        error "A server and credentialId are required for ${params.ARGOCD_ENVIRONMENT}."
+                    }
+                    env.ARGOCD_SERVER = selectedEnvironment.server.toString()
+                    env.ARGOCD_CREDENTIAL_ID = selectedEnvironment.credentialId.toString()
+                    echo "Target ArgoCD environment: ${params.ARGOCD_ENVIRONMENT} (${env.ARGOCD_SERVER})"
+                }
+            }
+        }
+
+        stage('Terraform Init') { steps { dir('argocd') { sh 'terraform init' } } }
+        stage('Terraform Validate') { steps { dir('argocd') { sh 'terraform fmt -check && terraform validate' } } }
+
+        stage('Generate Terraform Input') {
+            steps {
+                dir('argocd') {
+                    script {
+                        def services = [
+                            SERVICE_API:      [name: 'example-api',    path: 'services/example-api'],
+                            SERVICE_WORKER:   [name: 'example-worker', path: 'services/example-worker'],
+                            SERVICE_WEB:      [name: 'example-web',    path: 'services/example-web'],
+                            SUPPORTING_REDIS: [name: 'example-redis',  path: 'supporting/redis']
+                        ]
+                        def applications = [:]
+                        def pathPrefix = params.PATH_PREFIX?.trim()?.replaceAll('^/+|/+$', '') ?: ''
+                        def suffix = params.APPLICATION_SUFFIX?.trim() ?: ''
+                        services.each { parameterName, service ->
+                            if (params[parameterName]) {
+                                def applicationPath = pathPrefix ? "${pathPrefix}/${service.path}" : service.path
+                                applications["${service.name}${suffix}"] = [path: applicationPath, values_file: params.VALUES_FILE.trim()]
+                            }
+                        }
+                        if (applications.isEmpty()) { error 'At least one application must be selected.' }
+                        def terraformVariables = [
+                            project: params.PROJECT.trim(), repo_url: params.REPO_URL.trim(),
+                            target_revision: params.TARGET_REVISION.trim(), namespace: params.NAMESPACE.trim(),
+                            destination_server: params.DESTINATION_SERVER.trim(), applications: applications
+                        ]
+                        writeFile(file: 'jenkins.auto.tfvars.json', text: JsonOutput.prettyPrint(JsonOutput.toJson(terraformVariables)))
+                        echo "Action: ${params.ACTION}; project: ${params.PROJECT}; selected applications: ${applications.keySet().join(', ')}"
+                    }
+                }
+            }
+        }
+
+        stage('Prepare Terraform State') {
+            steps {
+                script {
+                    def stateKey = params.PROJECT.trim().replaceAll('[^a-zA-Z0-9._-]', '-')
+                    env.TF_STATE_DIR = "${params.STATE_BASE_DIR.trim()}/${stateKey}"
+                    env.TF_STATE_FILE = "${env.TF_STATE_DIR}/terraform.tfstate"
+                    sh 'mkdir -p "$TF_STATE_DIR"'
+                    echo "Terraform state file: ${env.TF_STATE_FILE}"
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            when { expression { params.ACTION == 'PLAN' || params.ACTION == 'APPLY' } }
+            steps { dir('argocd') { withCredentials([usernamePassword(credentialsId: env.ARGOCD_CREDENTIAL_ID, usernameVariable: 'ARGOCD_USERNAME', passwordVariable: 'ARGOCD_PASSWORD')]) { sh '''
+                export TF_VAR_argocd_server="$ARGOCD_SERVER"
+                export TF_VAR_argocd_username="$ARGOCD_USERNAME"
+                export TF_VAR_argocd_password="$ARGOCD_PASSWORD"
+                terraform plan -state="$TF_STATE_FILE" -var-file=jenkins.auto.tfvars.json -out=tfplan
+            ''' } } }
+        }
+
+        stage('Terraform Apply') {
+            when { expression { params.ACTION == 'APPLY' } }
+            steps { dir('argocd') { withCredentials([usernamePassword(credentialsId: env.ARGOCD_CREDENTIAL_ID, usernameVariable: 'ARGOCD_USERNAME', passwordVariable: 'ARGOCD_PASSWORD')]) { sh '''
+                export TF_VAR_argocd_server="$ARGOCD_SERVER"
+                export TF_VAR_argocd_username="$ARGOCD_USERNAME"
+                export TF_VAR_argocd_password="$ARGOCD_PASSWORD"
+                terraform apply -state="$TF_STATE_FILE" -auto-approve tfplan
+            ''' } } }
+        }
+
+        stage('Terraform Destroy Plan') {
+            when { expression { params.ACTION == 'DESTROY' && params.CONFIRM_DESTROY } }
+            steps { dir('argocd') { withCredentials([usernamePassword(credentialsId: env.ARGOCD_CREDENTIAL_ID, usernameVariable: 'ARGOCD_USERNAME', passwordVariable: 'ARGOCD_PASSWORD')]) { sh '''
+                export TF_VAR_argocd_server="$ARGOCD_SERVER"
+                export TF_VAR_argocd_username="$ARGOCD_USERNAME"
+                export TF_VAR_argocd_password="$ARGOCD_PASSWORD"
+                terraform plan -destroy -state="$TF_STATE_FILE" -var-file=jenkins.auto.tfvars.json -out=tfplan-destroy
+            ''' } } }
+        }
+
+        stage('Terraform Destroy') {
+            when { expression { params.ACTION == 'DESTROY' && params.CONFIRM_DESTROY } }
+            steps { dir('argocd') { withCredentials([usernamePassword(credentialsId: env.ARGOCD_CREDENTIAL_ID, usernameVariable: 'ARGOCD_USERNAME', passwordVariable: 'ARGOCD_PASSWORD')]) { sh '''
+                export TF_VAR_argocd_server="$ARGOCD_SERVER"
+                export TF_VAR_argocd_username="$ARGOCD_USERNAME"
+                export TF_VAR_argocd_password="$ARGOCD_PASSWORD"
+                terraform apply -state="$TF_STATE_FILE" -auto-approve tfplan-destroy
+            ''' } } }
+        }
+    }
+
+    post { always { sh 'rm -f argocd/jenkins.auto.tfvars.json argocd/tfplan argocd/tfplan-destroy' } }
+}

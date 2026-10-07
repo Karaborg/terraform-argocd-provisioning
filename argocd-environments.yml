@@ -1,0 +1,14 @@
+# Public example mapping. Replace placeholder endpoints and credential IDs in a
+# private deployment configuration; credentials themselves belong in Jenkins.
+credentials:
+  development:
+    server: "https://argocd.development.example.com"
+    credentialId: "argocd-development"
+
+  staging:
+    server: "https://argocd.staging.example.com"
+    credentialId: "argocd-staging"
+
+  production:
+    server: "https://argocd.production.example.com"
+    credentialId: "argocd-production"

@@ -1,0 +1,18 @@
+# Example only. Do not commit a real .tfvars file.
+# Supply argocd_username and argocd_password through TF_VAR_ environment variables
+# or through your CI/CD credential store.
+
+argocd_server = "https://argocd.development.example.com"
+
+project            = "platform-development"
+repo_url           = "https://github.com/example-org/example-app-config.git"
+target_revision    = "main"
+namespace          = "example-service"
+destination_server = "https://kubernetes.default.svc"
+
+applications = {
+  example-service = {
+    path        = "services/example-service"
+    values_file = "values-development.yaml"
+  }
+}
